@@ -12,20 +12,30 @@ import (
 
 // Return type for (*Poller)Poll
 type Polled struct {
-	Socket *Socket // socket with matched event(s)
-	Events State   // actual matched event(s)
+	SocketRef *SocketRef // socket with matched event(s)
+	Events    State      // actual matched event(s)
+}
+
+type SocketRef struct {
+	Index  int // public field to be used by the caller.
+	socket *Socket
+	idx    int // internal field to reference in items and socks slice.
+}
+
+func (sr *SocketRef) Socket() *Socket {
+	return sr.socket
 }
 
 type Poller struct {
 	items []C.zmq_pollitem_t
-	socks []*Socket
+	socks []*SocketRef
 }
 
 // Create a new Poller
 func NewPoller() *Poller {
 	return &Poller{
 		items: make([]C.zmq_pollitem_t, 0),
-		socks: make([]*Socket, 0),
+		socks: make([]*SocketRef, 0),
 	}
 }
 
@@ -35,14 +45,15 @@ func NewPoller() *Poller {
 //
 // Returns the id of the item, which can be used as a handle to
 // (*Poller)Update and as an index into the result of (*Poller)PollAll
-func (p *Poller) Add(soc *Socket, events State) int {
+func (p *Poller) Add(soc *Socket, events State) *SocketRef {
 	var item C.zmq_pollitem_t
 	item.socket = soc.soc
 	item.fd = 0
 	item.events = C.short(events)
+	socref := &SocketRef{socket: soc, idx: len(p.items)}
 	p.items = append(p.items, item)
-	p.socks = append(p.socks, soc)
-	return len(p.items) - 1
+	p.socks = append(p.socks, socref)
+	return socref
 }
 
 // Update the events mask of a socket in the poller
@@ -50,27 +61,11 @@ func (p *Poller) Add(soc *Socket, events State) int {
 // Replaces the Poller's bitmask for the specified id with the events parameter passed
 //
 // Returns the previous value, or ErrorNoSocket if the id was out of range
-func (p *Poller) Update(id int, events State) (previous State, err error) {
-	if id >= 0 && id < len(p.items) {
-		previous = State(p.items[id].events)
-		p.items[id].events = C.short(events)
+func (p *Poller) Update(soc *SocketRef, events State) (previous State, err error) {
+	if soc.idx >= 0 && soc.idx < len(p.items) {
+		previous = State(p.items[soc.idx].events)
+		p.items[soc.idx].events = C.short(events)
 		return previous, nil
-	}
-	return 0, ErrorNoSocket
-}
-
-// Update the events mask of a socket in the poller
-//
-// Replaces the Poller's bitmask for the specified socket with the events parameter passed
-//
-// Returns the previous value, or ErrorNoSocket if the socket didn't match
-func (p *Poller) UpdateBySocket(soc *Socket, events State) (previous State, err error) {
-	for id, s := range p.socks {
-		if s == soc {
-			previous = State(p.items[id].events)
-			p.items[id].events = C.short(events)
-			return previous, nil
-		}
 	}
 	return 0, ErrorNoSocket
 }
@@ -78,28 +73,17 @@ func (p *Poller) UpdateBySocket(soc *Socket, events State) (previous State, err 
 // Remove a socket from the poller
 //
 // Returns ErrorNoSocket if the id was out of range
-func (p *Poller) Remove(id int) error {
-	if id >= 0 && id < len(p.items) {
-		if id == len(p.items)-1 {
-			p.items = p.items[:id]
-			p.socks = p.socks[:id]
-		} else {
-			p.items = append(p.items[:id], p.items[id+1:]...)
-			p.socks = append(p.socks[:id], p.socks[id+1:]...)
+func (p *Poller) Remove(soc *SocketRef) error {
+	if soc.idx >= 0 && soc.idx < len(p.items) {
+		last := len(p.items) - 1
+		if len(p.items) > 1 {
+			p.items[soc.idx], p.items[last] = p.items[last], p.items[soc.idx]
+			p.socks[soc.idx], p.socks[last] = p.socks[last], p.socks[soc.idx]
+			p.socks[soc.idx].idx = soc.idx
 		}
+		p.items = p.items[:last]
+		p.socks = p.socks[:last]
 		return nil
-	}
-	return ErrorNoSocket
-}
-
-// Remove a socket from the poller
-//
-// Returns ErrorNoSocket if the socket didn't match
-func (p *Poller) RemoveBySocket(soc *Socket) error {
-	for id, s := range p.socks {
-		if s == soc {
-			return p.Remove(id)
-		}
 	}
 	return ErrorNoSocket
 }
@@ -153,7 +137,7 @@ func (p *Poller) poll(timeout time.Duration, all bool) ([]Polled, error) {
 	lst := make([]Polled, 0, len(p.items))
 
 	for _, soc := range p.socks {
-		if !soc.opened {
+		if !soc.socket.opened {
 			return lst, ErrorSocketClosed
 		}
 	}
